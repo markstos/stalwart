@@ -110,6 +110,14 @@ impl DnsLookup for Server {
         remote_host: &NextHop<'_>,
         envelope: &impl ResolveVariable,
     ) -> Result<IpLookupResult, Status<HostResponse<Box<str>>, ErrorDetails>> {
+        // If the hostname is already an IP address, return it directly
+        // without performing a DNS lookup.
+        if let Ok(ip) = remote_host.hostname().parse::<IpAddr>() {
+            return Ok(IpLookupResult {
+                remote_ips: vec![ip],
+            });
+        }
+
         let mut remote_ips = self
             .ip_lookup(
                 remote_host.fqdn_hostname().as_ref(),

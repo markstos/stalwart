@@ -19,6 +19,23 @@ relay = true
 ip-lookup = "ipv6_then_ipv4"
 "#;
 
+const LOCAL_RELAY_IP: &str = r#"
+[session.rcpt]
+relay = true
+
+[queue.strategy]
+route = "'relay-ip'"
+
+[queue.route.relay-ip]
+type = "relay"
+address = 127.0.0.1
+port = 9925
+
+[queue.route.relay-ip.tls]
+implicit = false
+allow-invalid-certs = true
+"#;
+
 const REMOTE: &str = r#"
 [session.ehlo]
 reject-non-fqdn = false
@@ -89,4 +106,32 @@ async fn ip_lookup_strategy() {
             );
         }
     }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn relay_to_ip_address() {
+    crate::enable_logging();
+
+    let mut remote = TestSMTP::new("smtp_relay_ip_remote", REMOTE).await;
+    let _rx = remote.start(&[ServerProtocol::Smtp]).await;
+
+    // No DNS entries added — delivery only works if the DNS lookup is skipped.
+    let mut local = TestSMTP::new("smtp_relay_ip_local", LOCAL_RELAY_IP).await;
+    let core = local.build_smtp();
+
+    let mut session = local.new_session();
+    session.data.remote_ip_str = "10.0.0.1".into();
+    session.eval_session_params().await;
+    session.ehlo("mx.test.org").await;
+    session
+        .send_message("john@test.org", &["bill@foobar.org"], "test:no_dkim", "250")
+        .await;
+    local
+        .queue_receiver
+        .expect_message_then_deliver()
+        .await
+        .try_deliver(core.clone());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    remote.queue_receiver.expect_message().await;
 }
