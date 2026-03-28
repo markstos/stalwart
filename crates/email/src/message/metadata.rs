@@ -309,6 +309,23 @@ impl<'x> DecodedParts<'x> {
             DecodedPartContent::Binary(binary) => binary.as_ref(),
         })
     }
+
+    /// Returns content-transfer-encoding decoded bytes for a part, **without**
+    /// charset conversion.  This is what IMAP BINARY fetch (RFC 3516) must
+    /// return for text parts — only the CTE is stripped; the raw charset
+    /// bytes are left intact so the client can convert using BODYSTRUCTURE.
+    pub fn transfer_decoded_contents(
+        &self,
+        message_id: usize,
+        part: &ArchivedMessageMetadataPart,
+    ) -> Option<Cow<'_, [u8]>> {
+        match self.raw_messages.get(message_id)? {
+            DecodedRawMessage::Borrowed(chain) => Some(part.contents(chain)),
+            DecodedRawMessage::Owned(vec) => {
+                Some(Cow::Owned(part.contents(&ChainedBytes::new(vec)).into_owned()))
+            }
+        }
+    }
 }
 
 impl DecodedPartContent<'_> {
@@ -1276,5 +1293,85 @@ impl From<&ArchivedMetadataContentType> for ContentType<'static> {
                     .collect(),
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::blob_hash::BlobHash;
+
+    /// Per RFC 3516 (IMAP BINARY extension), the server must only decode the
+    /// content-transfer-encoding (e.g. quoted-printable) when responding to a
+    /// BINARY fetch.  Charset conversion must NOT be performed — the client
+    /// uses the charset reported in BODYSTRUCTURE for that.
+    #[test]
+    fn binary_part_should_not_charset_convert() {
+        // A windows-1251 quoted-printable message matching the bug report's
+        // swaks reproduction test.
+        let raw_message = b"Content-Type: text/plain; charset=windows-1251\r\n\
+                            Content-Transfer-Encoding: quoted-printable\r\n\
+                            \r\n\
+                            =EF=F0=E8=E2=E5=F2 =EC=E8=F0\r\n";
+
+        // Parse the message
+        let message = mail_parser::MessageParser::default()
+            .parse(raw_message.as_slice())
+            .expect("Failed to parse test message");
+
+        let root_part = message.root_part();
+        let blob_body_offset = root_part.offset_body;
+        let raw_headers =
+            raw_message[root_part.offset_header as usize..root_part.offset_body as usize].to_vec();
+
+        let metadata = MessageMetadata {
+            preview: "".into(),
+            raw_headers: raw_headers.into_boxed_slice(),
+            contents: build_metadata_contents(message),
+            blob_hash: BlobHash::default(),
+            blob_body_offset,
+            rcvd_attach: 0,
+        };
+
+        // Simulate serialization roundtrip through storage
+        let archived_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&metadata)
+            .expect("Failed to serialize metadata");
+        let archived =
+            rkyv::access::<ArchivedMessageMetadata, rkyv::rancor::Error>(&archived_bytes)
+                .expect("Failed to access archived metadata");
+
+        // Reconstruct ChainedBytes as the IMAP fetch code does:
+        //   first  = raw headers
+        //   second = raw body (blob from blob_body_offset onward)
+        let raw_body = &raw_message[blob_body_offset as usize..];
+        let chain = ChainedBytes::new(metadata.raw_headers.as_ref()).with_last(raw_body);
+
+        let decoded = archived.decode_contents(chain.clone());
+
+        let part = &archived.contents[0].parts[0];
+        let part_offset = u32::from(part.offset_header) as usize;
+
+        // ---- What contents() returns (QP-decoded only, no charset conversion) ----
+        let raw_decoded = part.contents(&chain);
+        // Raw windows-1251 bytes are NOT valid UTF-8.
+        assert!(
+            std::str::from_utf8(raw_decoded.as_ref()).is_err(),
+            "QP-decoded windows-1251 bytes must not be valid UTF-8"
+        );
+
+        // ---- What binary_part() returns (QP-decoded AND charset-converted) ----
+        let binary = decoded.binary_part(0, part_offset).unwrap();
+        let transfer_decoded = decoded
+            .transfer_decoded_contents(0, part)
+            .expect("transfer_decoded_contents should return Some");
+        assert!(
+            std::str::from_utf8(transfer_decoded.as_ref()).is_err(),
+            "transfer_decoded_contents() must return raw charset bytes, not UTF-8"
+        );
+        assert_eq!(
+            transfer_decoded.as_ref(),
+            raw_decoded.as_ref(),
+            "transfer_decoded_contents() must equal contents() (CTE-only decode)"
+        );
     }
 }

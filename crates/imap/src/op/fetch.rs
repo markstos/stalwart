@@ -1077,12 +1077,14 @@ impl AsImapDataItem for ArchivedMessageMetadata {
             let part_offset = u32::from(part.offset_header) as usize;
             Ok(match &part.body {
                 ArchivedMetadataPartType::Text | ArchivedMetadataPartType::Html => {
-                    BodyContents::Text(String::from_utf8_lossy(get_partial_bytes(
+                    // RFC 3516: BINARY fetch only strips content-transfer-encoding.
+                    // Do NOT convert charset — the client handles that via BODYSTRUCTURE.
+                    BodyContents::Bytes(get_cow_partial_bytes(
                         decoded
-                            .binary_part(message_id, part_offset)
+                            .transfer_decoded_contents(message_id, part)
                             .unwrap_or_default(),
                         partial,
-                    )))
+                    ))
                     .into()
                 }
                 ArchivedMetadataPartType::Binary | ArchivedMetadataPartType::InlineBinary => {
@@ -1152,10 +1154,14 @@ impl AsImapDataItem for ArchivedMessageMetadata {
         }
 
         match &part.body {
-            ArchivedMetadataPartType::Text
-            | ArchivedMetadataPartType::Html
-            | ArchivedMetadataPartType::Binary
-            | ArchivedMetadataPartType::InlineBinary => decoded
+            ArchivedMetadataPartType::Text | ArchivedMetadataPartType::Html => {
+                // RFC 3516: size must match what BINARY fetch returns (no charset conversion).
+                decoded
+                    .transfer_decoded_contents(message_id, part)
+                    .map(|p| p.len())
+                    .unwrap_or_default()
+            }
+            ArchivedMetadataPartType::Binary | ArchivedMetadataPartType::InlineBinary => decoded
                 .part(message_id, u32::from(part.offset_header) as usize)
                 .map(|p| p.len())
                 .unwrap_or_default(),
