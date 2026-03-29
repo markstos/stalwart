@@ -455,20 +455,7 @@ impl EmailIngest for Server {
 
                 // Set receivedAt if not present
                 if params.received_at.is_none() {
-                    params.received_at = message
-                        .root_part()
-                        .headers()
-                        .iter()
-                        .filter_map(|header| {
-                            if let (HeaderName::Received, HeaderValue::Received(received)) =
-                                (&header.name, &header.value)
-                            {
-                                received.date.map(|dt| dt.to_timestamp() as u64)
-                            } else {
-                                None
-                            }
-                        })
-                        .max();
+                    params.received_at = most_recent_received_at(&message);
                 }
 
                 false
@@ -953,6 +940,28 @@ impl IngestSource<'_> {
     }
 }
 
+/// Returns the most recent *valid* date from the message's Received headers,
+/// as a Unix timestamp in seconds.
+fn most_recent_received_at(message: &mail_parser::Message) -> Option<u64> {
+    message
+        .root_part()
+        .headers()
+        .iter()
+        .filter_map(|header| {
+            if let (HeaderName::Received, HeaderValue::Received(received)) =
+                (&header.name, &header.value)
+            {
+                received
+                    .date
+                    .filter(|dt| dt.is_valid())
+                    .map(|dt| dt.to_timestamp() as u64)
+            } else {
+                None
+            }
+        })
+        .max()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeThreadIds<T> {
     pub thread_hash: CheekyHash,
@@ -1105,5 +1114,54 @@ impl ThreadMerge {
             thread_id: max_thread_id,
             merge_ids,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::most_recent_received_at;
+    use mail_parser::MessageParser;
+
+    #[test]
+    fn received_at_invalid_date() {
+        // Valid Received header — should extract the timestamp.
+        let valid = MessageParser::new()
+            .parse(concat!(
+                "Received: from mx.example.com by mx2.example.com;\r\n",
+                "    Mon, 14 Apr 2025 18:45:18 +0000\r\n",
+                "From: a@b.com\r\nTo: c@d.com\r\n\r\nbody\r\n",
+            ).as_bytes())
+            .unwrap();
+        let ts = most_recent_received_at(&valid);
+        assert!(ts.is_some(), "valid Received date should be extracted");
+        assert!(
+            ts.unwrap() < 2_000_000_000,
+            "timestamp should be reasonable, got {}",
+            ts.unwrap()
+        );
+
+        // Invalid month "Xxx" — should be filtered out (None).
+        let invalid = MessageParser::new()
+            .parse(concat!(
+                "Received: from mx.example.com by mx2.example.com;\r\n",
+                "    14 Xxx 2025 18:45:18 +0000\r\n",
+                "From: a@b.com\r\nTo: c@d.com\r\n\r\nbody\r\n",
+            ).as_bytes())
+            .unwrap();
+        assert_eq!(
+            most_recent_received_at(&invalid),
+            None,
+            "invalid Received date should be treated as missing"
+        );
+
+        // No Received header at all — should return None.
+        let none = MessageParser::new()
+            .parse(b"From: a@b.com\r\nTo: c@d.com\r\n\r\nbody\r\n")
+            .unwrap();
+        assert_eq!(
+            most_recent_received_at(&none),
+            None,
+            "missing Received header should return None"
+        );
     }
 }
